@@ -1,0 +1,684 @@
+
+%% CELL 1: CONFIGURATION, DATA LOADING, AND FEATURE EXTRACTION
+clear; clc; close all;
+
+% --- Configuration ---
+dataPath = 'C:\Users\Asus\Desktop\eeg-during-mental-arithmetic-tasks-1.0.0';
+fs = 500;  
+window_sec = 2;                     
+window_size = fs * window_sec;      
+step_size = window_size;            
+
+bands.delta = [0.5, 4];
+bands.theta = [4, 8];
+bands.alpha = [8, 13];
+bands.beta  = [13, 30];
+bands.gamma = [30, 50];
+
+% --- Main Execution ---
+files = dir(fullfile(dataPath, '*.edf'));
+num_files = length(files);
+fprintf('Processing %d files...\n', num_files);
+
+X_cell = cell(num_files, 1);
+y_cell = cell(num_files, 1);
+
+parfor i = 1:num_files
+    file_name = files(i).name;
+    file_path = fullfile(dataPath, file_name);
+    
+    label = 2;
+    if contains(file_name, '_1.edf')
+        label = 1;
+    end
+    
+    try
+        T = edfread(file_path);
+        num_channels = min(21, width(T));
+        
+        first_ch_data = T{:, 1};
+        if iscell(first_ch_data), first_ch_data = cell2mat(first_ch_data); end
+        n_samples = length(first_ch_data);
+        data = zeros(num_channels, n_samples);
+        
+        for ch = 1:num_channels
+            ch_data = T{:, ch};
+            if iscell(ch_data), data(ch, :) = cell2mat(ch_data)';
+            else, data(ch, :) = ch_data'; end
+        end
+        
+        n_windows = floor(n_samples / window_size);
+        file_features = zeros(n_windows, 21 * 20); 
+        
+        for w = 1:n_windows
+            start_idx = (w-1)*step_size + 1;
+            end_idx = start_idx + window_size - 1;
+            window_data = data(:, start_idx:end_idx);
+            
+            window_features = zeros(1, 21 * 20);
+            for ch = 1:21
+                ch_features = process_channel(window_data(ch, :), fs, bands);
+                idx_start = (ch-1)*20 + 1;
+                idx_end = ch*20;
+                window_features(idx_start:idx_end) = ch_features;
+            end
+            file_features(w, :) = window_features;
+        end
+        
+        X_cell{i} = file_features;
+        y_cell{i} = repmat(label, n_windows, 1);
+    catch ME
+        fprintf('Error processing %s: %s\n', file_name, ME.message);
+    end
+end
+
+% --- Compilation and Saving ---
+X = vertcat(X_cell{:});
+y = vertcat(y_cell{:});
+
+fprintf('\n✅ Final feature matrix shape: [%d, %d]\n', size(X, 1), size(X, 2));
+save('eeg_features_final.mat', 'X', 'y', '-v7.3');
+fprintf('💾 Features saved to: eeg_features_final.mat\n');
+
+%% CELL 2: NORMALIZATION, STATISTICAL ANALYSIS, AND VISUALIZATION
+% --- Load Data ---
+if ~exist('X', 'var')
+    load('eeg_features_final.mat');
+end
+
+% --- Splitting and Normalization (Section 3.3) ---
+fprintf('\nSplitting data into 80%% Training and 20%% Testing sets...\n');
+rng("shuffle"); 
+y_cell_char = cellstr(string(y)); 
+cv = cvpartition(y_cell_char, 'HoldOut', 0.2);
+
+
+X_train_raw = X(training(cv), :);
+y_train = y(training(cv), :);
+X_test_raw = X(test(cv), :);
+y_test = y(test(cv), :);
+
+mu_train = mean(X_train_raw);
+sigma_train = std(X_train_raw);
+sigma_train(sigma_train == 0) = 1; % Prevent division by zero
+
+X_train = (X_train_raw - mu_train) ./ sigma_train;
+X_test = (X_test_raw - mu_train) ./ sigma_train;
+fprintf('✅ Features properly Z-score normalized based strictly on training statistics.\n');
+
+% --- Statistical Analysis (Section 3.4) ---
+num_features = size(X_train, 2);
+p_values_t = zeros(num_features, 1);
+p_values_mwu = zeros(num_features, 1);
+
+class1_data = X_train(y_train == 1, :); 
+class2_data = X_train(y_train == 2, :); 
+
+fprintf('\nComputing p-values for %d features...\n', num_features);
+for i = 1:num_features
+    [~, p_t] = ttest2(class1_data(:, i), class2_data(:, i));
+    p_values_t(i) = p_t;
+    p_mwu = ranksum(class1_data(:, i), class2_data(:, i));
+    p_values_mwu(i) = p_mwu;
+end
+
+sig_level = repmat("Not Sig", num_features, 1);
+sig_level(p_values_mwu < 0.05) = "p < 0.05";
+sig_level(p_values_mwu < 0.01) = "p < 0.01";
+sig_level(p_values_mwu < 0.001) = "p < 0.001";
+
+FeatureIndex = (1:num_features)';
+StatsReport = table(FeatureIndex, p_values_t, p_values_mwu, sig_level, ...
+    'VariableNames', {'Feature_ID', 'T_Test_pValue', 'MWU_pValue', 'Significance'});
+
+StatsReport = sortrows(StatsReport, 'MWU_pValue');
+fprintf('\n✅ Statistical Report generated. Showing the top 15 most discriminative features:\n');
+disp(head(StatsReport, 15));
+
+% --- Visualization of Top Features ---
+top_features = StatsReport{1:12, 1};
+
+figure('Name', 'Top Discriminative Features', 'Position', [100, 100, 1200, 800]);
+t = tiledlayout(3, 4, 'TileSpacing', 'compact', 'Padding', 'compact');
+title(t, 'Distributions of Top 12 Most Discriminative Features (Rest vs Task)', ...
+      'FontSize', 14, 'FontWeight', 'bold');
+class_labels = categorical(y_train, [1, 2], {'Rest', 'Task'});
+
+for i = 1:length(top_features)
+    feat_idx = top_features(i);
+    nexttile;
+    boxchart(class_labels, X_train(:, feat_idx), 'GroupByColor', class_labels);
+    p_val = StatsReport{i, 3};
+    title(sprintf('Feature %d\np = %.2e', feat_idx, p_val), 'FontSize', 10);
+    ylabel('Z-score');
+    legend('off'); 
+end
+
+
+%% 10. FEATURE SELECTION & FULL REPORTING (Filter, Wrapper, Embedded)
+fprintf('\n============================================================\n');
+fprintf('STARTING FEATURE SELECTION & REPORTING\n');
+fprintf('============================================================\n');
+
+num_features = size(X_train, 2);
+k_top = 20; % تعداد فیچرهای برتر برای گزارش و نمودار
+
+% ==========================================
+% A. FILTER METHODS
+% ==========================================
+
+% --- 1. FDR (Fisher's Discriminant Ratio) ---
+tic;
+mu1 = mean(X_train(y_train == 1, :));
+mu2 = mean(X_train(y_train == 2, :));
+var1 = var(X_train(y_train == 1, :));
+var2 = var(X_train(y_train == 2, :));
+
+fdr_scores = (mu1 - mu2).^2 ./ (var1 + var2 + 1e-10); 
+[fdr_sorted, fdr_idx] = sort(fdr_scores, 'descend');
+time_fdr = toc;
+
+fprintf('\n>>> 1. FDR (Fisher''s Discriminant Ratio) <<<\n');
+fprintf('Computational Time: %.3f seconds\n', time_fdr);
+fprintf('Number of features selected: %d\n', k_top);
+T_fdr = table(fdr_idx(1:k_top)', fdr_sorted(1:k_top)', 'VariableNames', {'Feature_ID', 'FDR_Score'});
+disp(T_fdr);
+
+% --- 2. Mutual Information (MI) ---
+tic;
+mi_scores = zeros(1, num_features);
+p_y1 = sum(y_train==1) / length(y_train);
+p_y2 = sum(y_train==2) / length(y_train);
+H_Y = -p_y1*log2(p_y1) - p_y2*log2(p_y2); 
+
+for i = 1:num_features
+    edges = linspace(min(X_train(:,i)), max(X_train(:,i)), 11);
+    bins = discretize(X_train(:,i), edges);
+    H_Y_given_X = 0;
+    for b = 1:10
+        idx_b = (bins == b);
+        p_x = sum(idx_b) / length(y_train);
+        if p_x > 0
+            p_y1_given_x = sum(y_train(idx_b)==1) / sum(idx_b);
+            p_y2_given_x = sum(y_train(idx_b)==2) / sum(idx_b);
+            h_temp = 0;
+            if p_y1_given_x > 0, h_temp = h_temp - p_y1_given_x*log2(p_y1_given_x); end
+            if p_y2_given_x > 0, h_temp = h_temp - p_y2_given_x*log2(p_y2_given_x); end
+            H_Y_given_X = H_Y_given_X + p_x * h_temp;
+        end
+    end
+    mi_scores(i) = H_Y - H_Y_given_X; 
+end
+[mi_sorted, mi_idx] = sort(mi_scores, 'descend');
+time_mi = toc;
+
+fprintf('\n>>> 2. Mutual Information (MI) <<<\n');
+fprintf('Computational Time: %.3f seconds\n', time_mi);
+fprintf('Number of features selected: %d\n', k_top);
+T_mi = table(mi_idx(1:k_top)', mi_sorted(1:k_top)', 'VariableNames', {'Feature_ID', 'MI_Score'});
+disp(T_mi);
+
+% --- 3. mRMR (minimum Redundancy Maximum Relevance) ---
+tic;
+[mrmr_idx, mrmr_scores] = fscmrmr(X_train, y_train);
+mrmr_sorted = mrmr_scores(mrmr_idx);
+time_mrmr = toc;
+
+fprintf('\n>>> 3. mRMR <<<\n');
+fprintf('Computational Time: %.3f seconds\n', time_mrmr);
+fprintf('Number of features selected: %d\n', k_top);
+T_mrmr = table(mrmr_idx(1:k_top)', mrmr_sorted(1:k_top)', 'VariableNames', {'Feature_ID', 'mRMR_Score'});
+disp(T_mrmr);
+
+% ==========================================
+% B. WRAPPER METHODS
+% ==========================================
+
+% --- 1. ReliefF Algorithm ---
+tic;
+[relief_idx, relief_weights] = relieff(X_train, y_train, 10);
+relief_sorted = relief_weights(relief_idx);
+time_relief = toc;
+
+fprintf('\n>>> 4. ReliefF Algorithm <<<\n');
+fprintf('Computational Time: %.3f seconds\n', time_relief);
+fprintf('Number of features selected: %d\n', k_top);
+T_relief = table(relief_idx(1:k_top)', relief_sorted(1:k_top)', 'VariableNames', {'Feature_ID', 'ReliefF_Weight'});
+disp(T_relief);
+
+% ==========================================
+% C. EMBEDDED METHODS
+% ==========================================
+
+% --- 1. LASSO (L1 Regularization) ---
+tic;
+y_train_bin = (y_train == 2); 
+
+% تنظیمات بهینه‌تر
+opts = statset('MaxIter', 10000);  % افزایش منطقی iteration
+
+% بازه کنترل‌شده Lambda (به جای NumLambda خام)
+lambda_vals = logspace(-3, -1, 15);
+
+[B_lasso, FitInfo] = lassoglm(X_train, y_train_bin, 'binomial', ...
+    'Lambda', lambda_vals, ...
+    'Standardize', false, ...  % چون قبلاً نرمال کردی
+    'Options', opts);
+
+% پیدا کردن مدلی که حدوداً k_top ویژگی نگه داشته
+num_non_zero = sum(B_lasso ~= 0, 1);
+[~, best_lambda_idx] = min(abs(num_non_zero - k_top));
+if best_lambda_idx == 0, best_lambda_idx = 1; end
+
+lasso_weights = abs(B_lasso(:, best_lambda_idx))'; 
+[lasso_sorted, lasso_idx] = sort(lasso_weights, 'descend');
+time_lasso = toc;
+
+num_lasso_selected = sum(lasso_sorted > 0); 
+num_to_show_lasso = min(k_top, num_lasso_selected);
+
+fprintf('\n>>> 5. LASSO (L1 Regularization) <<<\n');
+fprintf('Computational Time: %.3f seconds\n', time_lasso);
+fprintf('Number of features selected by algorithm: %d (non-zero weights)\n', num_lasso_selected);
+
+T_lasso = table(lasso_idx(1:num_to_show_lasso)', ...
+                lasso_sorted(1:num_to_show_lasso)', ...
+                'VariableNames', {'Feature_ID', 'Absolute_Weight'});
+disp(T_lasso);
+% --- 2. Random Forest Feature Importance ---
+tic;
+rf_mdl = TreeBagger(50, X_train, y_train, 'Method', 'classification', 'OOBPredictorImportance', 'on');
+rf_scores = rf_mdl.OOBPermutedPredictorDeltaError;
+[rf_sorted, rf_idx] = sort(rf_scores, 'descend');
+time_rf = toc;
+
+fprintf('\n>>> 6. Random Forest Feature Importance <<<\n');
+fprintf('Computational Time: %.3f seconds\n', time_rf);
+fprintf('Number of features selected: %d\n', k_top);
+T_rf = table(rf_idx(1:k_top)', rf_sorted(1:k_top)', 'VariableNames', {'Feature_ID', 'Importance_Score'});
+disp(T_rf);
+
+% ==========================================
+% VISUALIZATION: BAR PLOTS
+% ==========================================
+figure('Name', 'Feature Selection Methods Comparison', 'Position', [100, 50, 1400, 900]);
+t = tiledlayout(2, 3, 'TileSpacing', 'compact', 'Padding', 'compact');
+title(t, 'Top Feature Importances by Method', 'FontSize', 16, 'FontWeight', 'bold');
+
+nexttile; bar(fdr_sorted(1:k_top), 'FaceColor', [0.2 0.6 0.8]);
+set(gca, 'XTick', 1:k_top, 'XTickLabel', fdr_idx(1:k_top)); xtickangle(45); 
+title(sprintf('FDR\nSelected: %d | Time: %.2fs', k_top, time_fdr)); ylabel('Score');
+
+nexttile; bar(mi_sorted(1:k_top), 'FaceColor', [0.8 0.4 0.2]);
+set(gca, 'XTick', 1:k_top, 'XTickLabel', mi_idx(1:k_top)); xtickangle(45); 
+title(sprintf('Mutual Information\nSelected: %d | Time: %.2fs', k_top, time_mi));
+
+nexttile; bar(mrmr_sorted(1:k_top), 'FaceColor', [0.4 0.8 0.4]);
+set(gca, 'XTick', 1:k_top, 'XTickLabel', mrmr_idx(1:k_top)); xtickangle(45); 
+title(sprintf('mRMR\nSelected: %d | Time: %.2fs', k_top, time_mrmr));
+
+nexttile; bar(relief_sorted(1:k_top), 'FaceColor', [0.6 0.4 0.8]);
+set(gca, 'XTick', 1:k_top, 'XTickLabel', relief_idx(1:k_top)); xtickangle(45); 
+title(sprintf('ReliefF\nSelected: %d | Time: %.2fs', k_top, time_relief)); ylabel('Weight');
+
+nexttile; bar(lasso_sorted(1:num_to_show_lasso), 'FaceColor', [0.9 0.7 0.2]);
+set(gca, 'XTick', 1:num_to_show_lasso, 'XTickLabel', lasso_idx(1:num_to_show_lasso)); xtickangle(45); 
+title(sprintf('LASSO (Abs Coeff)\nSelected: %d | Time: %.2fs', num_lasso_selected, time_lasso));
+
+nexttile; bar(rf_sorted(1:k_top), 'FaceColor', [0.3 0.3 0.3]);
+set(gca, 'XTick', 1:k_top, 'XTickLabel', rf_idx(1:k_top)); xtickangle(45); 
+title(sprintf('Random Forest\nSelected: %d | Time: %.2fs', k_top, time_rf));
+%% 11. ENSEMBLE FEATURE SELECTION (Majority Voting) & SLICING DATA
+fprintf('\n============================================================\n');
+fprintf('FINAL ENSEMBLE FEATURE SELECTION (VOTING SYSTEM)\n');
+fprintf('============================================================\n');
+
+% 1. Collect all top features from the 6 previous methods
+% (LASSO is already filtered to only include non-zero weights)
+all_selected_features = [fdr_idx(1:k_top)'; 
+                         mi_idx(1:k_top)'; 
+                         mrmr_idx(1:k_top)'; 
+                         relief_idx(1:k_top)'; 
+                         lasso_idx(1:num_to_show_lasso)'; 
+                         rf_idx(1:k_top)'];
+
+% 2. Count the votes (frequency of occurrence for each feature)
+[vote_counts, unique_features] = groupcounts(all_selected_features);
+
+% 3. Sort features in descending order based on the number of votes
+[sorted_votes, sort_indices] = sort(vote_counts, 'descend');
+sorted_feature_ids = unique_features(sort_indices);
+
+% 4. Select the final top 20 features with the highest votes
+num_final_features = min(20, length(sorted_feature_ids));
+final_selected_ids = sorted_feature_ids(1:num_final_features);
+final_selected_votes = sorted_votes(1:num_final_features);
+
+% 5. Decode feature IDs into readable names
+% List of the 20 base features extracted in the process_channel function:
+feature_names_list = ["Mean", "Std", "Median", "Skewness", "Kurtosis", "RMS", "ZCR", ...
+                      "Hjorth Activity", "Hjorth Mobility", "Hjorth Complexity", ...
+                      "Shannon Entropy", "Spectral Entropy", "ApEn(0)", "SampEn(0)", "PermEn(0)", ...
+                      "Delta Power (0.5-4 Hz)", "Theta Power (4-8 Hz)", "Alpha Power (8-13 Hz)", ...
+                      "Beta Power (13-30 Hz)", "Gamma Power (30-50 Hz)"];
+
+final_feature_names = strings(num_final_features, 1);
+
+for i = 1:num_final_features
+    id = final_selected_ids(i);
+    
+    % Find channel number (divide by 20 and round up)
+    channel_num = ceil(id / 20);
+    
+    % Find the specific feature index (remainder of division)
+    feat_idx = mod(id - 1, 20) + 1;
+    
+    % Combine channel and feature name
+    final_feature_names(i) = sprintf('Channel %d - %s', channel_num, feature_names_list(feat_idx));
+end
+
+% 6. Create and display the final report table
+Final_Report_Table = table(final_selected_ids, final_selected_votes, final_feature_names, ...
+    'VariableNames', {'Feature_ID', 'Total_Votes', 'Feature_Name'});
+
+fprintf('✅ The Final Golden Features based on Ensemble Voting:\n\n');
+disp(Final_Report_Table);
+
+% 7. Slice the dataset (Reduce dimensionality from 420 to 20 columns)
+X_train_final = X_train(:, final_selected_ids);
+X_test_final  = X_test(:, final_selected_ids);
+
+fprintf('✅ Dataset successfully sliced!\n');
+fprintf('   - New X_train shape: [%d rows x %d columns]\n', size(X_train_final, 1), size(X_train_final, 2));
+fprintf('   - New X_test shape:  [%d rows x %d columns]\n', size(X_test_final, 1), size(X_test_final, 2));
+%% 12. DIMENSIONALITY REDUCTION METHODS (Section 3.6)
+fprintf('\n============================================================\n');
+fprintf('STARTING DIMENSIONALITY REDUCTION ANALYSIS\n');
+fprintf('============================================================\n');
+
+% Prepare categorical labels for plots
+class_names = {'Rest', 'Task'};
+target_labels = categorical(y_train, [1, 2], class_names);
+
+% --- 1. PCA (Principal Component Analysis) ---
+tic;
+[coeff, score, latent, tsquared, explained] = pca(X_train_final);
+cum_explained = cumsum(explained);
+time_pca = toc;
+
+fprintf('\n>>> 1. PCA Report <<<\n');
+fprintf('Computational Time: %.3f seconds\n', time_pca);
+fprintf('Cumulative Variance Explained (First 3 Components): %.2f%%\n', cum_explained(min(3, end)));
+
+% Plot Scree and Cumulative Variance
+figure('Name', 'PCA Analysis', 'Units', 'normalized', 'Position', [0.1 0.1 0.4 0.4]);
+yyaxis left
+bar(explained, 'FaceColor', [0.7 0.7 0.7]); ylabel('Individual Variance (%)');
+yyaxis right
+plot(cum_explained, '-o', 'LineWidth', 1.5); ylabel('Cumulative Variance (%)');
+grid on; xlabel('Principal Component'); title('PCA: Scree & Cumulative Variance Plot');
+
+% --- 2. LDA (Linear Discriminant Analysis) ---
+tic;
+% LDA is supervised; it maximizes class separability
+% To get eigenvalues, we calculate the Scatter Matrices manually
+group1 = X_train_final(y_train == 1, :);
+group2 = X_train_final(y_train == 2, :);
+
+% Mean of each class and global mean
+mu1 = mean(group1);
+mu2 = mean(group2);
+muTotal = mean(X_train_final);
+
+% Between-class scatter matrix (Sb)
+Sb = (size(group1,1)*(mu1 - muTotal)'*(mu1 - muTotal)) + ...
+     (size(group2,1)*(mu2 - muTotal)'*(mu2 - muTotal));
+
+% Within-class scatter matrix (Sw)
+Sw = cov(group1)*(size(group1,1)-1) + cov(group2)*(size(group2,1)-1);
+
+% Solve for Eigenvalues (Discrimination Power)
+% We solve the generalized eigenvalue problem: Sb*v = lambda*Sw*v
+lda_eigenvalues = eig(Sb, Sw);
+% For 2 classes, there is only 1 non-zero eigenvalue
+max_lda_eig = max(lda_eigenvalues);
+
+% Get the scores for plotting using fitcdiscr
+Mdl_lda = fitcdiscr(X_train_final, y_train);
+[~, lda_score] = predict(Mdl_lda, X_train_final); 
+% For binary LDA, the second column of 'score' represents the discriminant axis
+lda_projection = lda_score(:,2) - lda_score(:,1); 
+
+time_lda = toc;
+
+fprintf('\n>>> 2. LDA Report <<<\n');
+fprintf('Computational Time: %.3f seconds\n', time_lda);
+fprintf('Principal Eigenvalue (Discrimination Power): %.4f\n', max_lda_eig);
+% --- 3. ICA (Independent Component Analysis) ---
+tic;
+% Using 'rica' (Reconstruction ICA) for source separation
+num_ica_comp = 3; 
+Mdl_ica = rica(X_train_final, num_ica_comp);
+ica_score = transform(Mdl_ica, X_train_final);
+time_ica = toc;
+
+fprintf('\n>>> 3. ICA Report <<<\n');
+fprintf('Computational Time: %.3f seconds\n', time_ica);
+fprintf('ICA components extracted: %d\n', num_ica_comp);
+
+% --- 4. t-SNE (t-Distributed Stochastic Neighbor Embedding) ---
+tic;
+% Non-linear visualization method
+tsne_score = tsne(X_train_final, 'Algorithm', 'exact', 'Distance', 'euclidean');
+time_tsne = toc;
+
+fprintf('\n>>> 4. t-SNE Report <<<\n');
+fprintf('Computational Time: %.3f seconds\n', time_tsne);
+
+% --- 5. Kernel PCA (Non-linear PCA) ---
+tic;
+% Testing RBF (Gaussian) Kernel
+% Note: Standard PCA is on the kernel matrix
+K = exp(-pdist2(X_train_final, X_train_final).^2 ./ (2 * size(X_train_final, 2)));
+% Center the kernel matrix
+N = size(K, 1);
+one_n = ones(N, N) / N;
+K_centered = K - one_n * K - K * one_n + one_n * K * one_n;
+[k_vectors, k_values] = eigs(K_centered, 2);
+kpca_score = K_centered * k_vectors;
+time_kpca = toc;
+
+fprintf('\n>>> 5. Kernel PCA Report <<<\n');
+fprintf('Computational Time: %.3f seconds\n', time_kpca);
+fprintf('Kernel Type: RBF (Gaussian)\n');
+
+% ============================================================
+% VISUALIZATION: REDUCED FEATURE SPACES
+% ============================================================
+figure('Name', 'Dimensionality Reduction Comparison', 'Units', 'normalized', 'Position', [0.1 0.1 0.8 0.7]);
+t_layout = tiledlayout(2, 3, 'TileSpacing', 'compact');
+title(t_layout, 'Comparison of Dimensionality Reduction Methods (Class Separability)', 'FontSize', 14);
+
+% PCA Scatter
+nexttile; gscatter(score(:,1), score(:,2), target_labels, 'rb', 'o+');
+title('PCA (2D Projection)'); grid on;
+
+% LDA Histogram (Since LDA only has 1 dimension for 2 classes)
+nexttile; h1 = histogram(lda_score(y_train==1), 'FaceColor', 'r', 'Normalization', 'pdf'); hold on;
+h2 = histogram(lda_score(y_train==2), 'FaceColor', 'b', 'Normalization', 'pdf');
+title('LDA: Class Separability'); legend(class_names); grid on;
+
+% ICA Scatter
+nexttile; gscatter(ica_score(:,1), ica_score(:,2), target_labels, 'rb', 'o+');
+title('ICA (Source Separation)'); grid on;
+
+% t-SNE Scatter
+nexttile; gscatter(tsne_score(:,1), tsne_score(:,2), target_labels, 'rb', 'o+');
+title('t-SNE (Non-linear Visualization)'); grid on;
+
+% Kernel PCA Scatter
+nexttile; gscatter(kpca_score(:,1), kpca_score(:,2), target_labels, 'rb', 'o+');
+title('Kernel PCA (RBF Kernel)'); grid on;
+
+% 3D PCA for Analysis
+nexttile; scatter3(score(:,1), score(:,2), score(:,3), 15, y_train, 'filled');
+colormap([1 0 0; 0 0 1]); view(30, 35);
+title('PCA 3D Visualization'); grid on; xlabel('PC1'); ylabel('PC2'); zlabel('PC3');
+%% 13. FINAL CLASSIFICATION & 10-FOLD CROSS-VALIDATION (Section 3.7 & 3.9)
+fprintf('\n============================================================\n');
+fprintf('STARTING COMPREHENSIVE CLASSIFICATION & EVALUATION\n');
+fprintf('============================================================\n');
+
+% Combine data for 10-fold CV as requested in section 3.9
+X_all = [X_train_final; X_test_final];
+y_all = [y_train; y_test];
+
+% Define the full list of classifiers from Section 3.7
+% Using a cell array of function handles for clean execution
+% Final Corrected Model List based on Section 3.7
+% Final Stabilized Model List - Tested for MATLAB 2024+ compatibility
+models = {
+    @(X,y) fitcnb(X,y);                                         % 1. Naive Bayes
+    @(X,y) fitcknn(X,y, 'NumNeighbors', 5);                     % 2. k-NN
+    @(X,y) fitcsvm(X,y, 'KernelFunction', 'rbf');               % 3. SVM
+    @(X,y) fitcdiscr(X,y);                                      % 4. LDA
+    @(X,y) fitctree(X,y);                                       % 5. Decision Trees
+    @(X,y) fitcensemble(X,y, 'Method', 'Bag');                  % 6. Random Forest
+    @(X,y) fitcensemble(X,y, 'Method', 'LogitBoost');           % 7. Gradient Boosting
+    @(X,y) fitclinear(X,y, 'Learner', 'logistic');              % 8. Logistic Regression
+    @(X,y) fitcensemble(X,y, 'Method', 'Subspace', 'Learners', templateKNN('NumNeighbors', 3)) % 9. Ensemble Voting
+};
+
+model_names = {'Naive Bayes', 'k-NN', 'SVM', 'LDA', 'Decision Tree', ...
+               'Random Forest', 'Gradient Boost', 'Logistic Reg', 'Ensemble Voting'};
+
+% 10-Fold Stratified Cross-Validation setup (Section 3.9)
+K = 10;
+cvp = cvpartition(y_all, 'KFold', K, 'Stratify', true);
+
+% Metrics storage: [Models x Metrics x Folds]
+% Metrics: 1.Acc, 2.Sens, 3.Spec, 4.Prec, 5.F1, 6.AUC, 7.Kappa, 8.MCC
+all_results = zeros(length(models), 8, K);
+
+fprintf('Running 10-Fold CV for %d models... Please wait.\n', length(models));
+
+for m = 1:length(models)
+    fprintf('-> Training & Evaluating: %s\n', model_names{m});
+    for k = 1:K
+        % Training and Validation sets for current fold
+        X_tr = X_all(cvp.training(k), :);
+        y_tr = y_all(cvp.training(k), :);
+        X_te = X_all(cvp.test(k), :);
+        y_te = y_all(cvp.test(k), :);
+        
+        % Train model
+        mdl = models{m}(X_tr, y_tr);
+        
+        % Predict
+        [y_pred, scores] = predict(mdl, X_te);
+        if iscell(y_pred), y_pred = str2double(y_pred); end
+        
+        % Confusion Matrix metrics
+        cp = confusionmat(y_te, y_pred);
+        TN = cp(1,1); FP = cp(1,2); FN = cp(2,1); TP = cp(2,2);
+        
+        % 1. Accuracy
+        all_results(m,1,k) = (TP + TN) / (TP + TN + FP + FN);
+        % 2. Sensitivity (Recall)
+        all_results(m,2,k) = TP / (TP + FN);
+        % 3. Specificity
+        all_results(m,3,k) = TN / (TN + FP);
+        % 4. Precision
+        all_results(m,4,k) = TP / (TP + FP);
+        % 5. F1-Score
+        all_results(m,5,k) = 2 * (all_results(m,4,k) * all_results(m,2,k)) / (all_results(m,4,k) + all_results(m,2,k));
+        
+        % 6. AUC-ROC (Area under curve)
+        [~,~,~,auc] = perfcurve(y_te, scores(:,2), 2);
+        all_results(m,6,k) = auc;
+        
+        % 7. Cohen's Kappa
+        p0 = all_results(m,1,k);
+        pe = ((TP+FP)*(TP+FN) + (TN+FN)*(TN+FP)) / (length(y_te)^2);
+        all_results(m,7,k) = (p0 - pe) / (1 - pe);
+        
+        % 8. MCC (Matthews Correlation Coefficient)
+        num = (TP*TN - FP*FN);
+        den = sqrt((TP+FP)*(TP+FN)*(TN+FP)*(TN+FN));
+        all_results(m,8,k) = num / max(den, eps);
+    end
+end
+
+% --- Final Reporting: Mean +/- Std Deviation (Section 3.9 Report Format) ---
+fprintf('\n============================================================\n');
+fprintf('FINAL REPORT: PERFORMANCE ACROSS 10 FOLDS (Mean +/- STD)\n');
+fprintf('============================================================\n');
+
+metric_titles = {'Accuracy', 'Sensitivity', 'Specificity', 'Precision', 'F1_Score', 'AUC_ROC', 'Kappa', 'MCC'};
+final_table_data = strings(length(models), length(metric_titles));
+
+for m = 1:length(models)
+    for j = 1:length(metric_titles)
+        m_val = mean(all_results(m,j,:), 'omitnan');
+        s_val = std(all_results(m,j,:), 'omitnan');
+        final_table_data(m,j) = sprintf('%.3f ± %.3f', m_val, s_val);
+    end
+end
+
+T_final = table(final_table_data(:,1), final_table_data(:,2), final_table_data(:,3), ...
+                final_table_data(:,4), final_table_data(:,5), final_table_data(:,6), ...
+                final_table_data(:,7), final_table_data(:,8), ...
+                'RowNames', model_names, 'VariableNames', metric_titles);
+disp(T_final);
+% ============================================================
+% LOCAL FUNCTION (Must remain at the bottom of the file)
+% ============================================================
+function features = process_channel(segment, fs, bands)
+    mean_val = mean(segment);
+    std_val = std(segment);
+    median_val = median(segment);
+    skew_val = skewness(segment);
+    kurt_val = kurtosis(segment);
+    rms_val = rms(segment);
+    zcr_val = mean(diff(sign(segment)) ~= 0);
+    
+    var0 = var(segment);
+    dx = diff(segment);
+    var1 = var(dx);
+    ddx = diff(dx);
+    var2 = var(ddx);
+    
+    activity = var0;
+    mobility = 0;
+    complexity = 0;
+    
+    if var0 > 0, mobility = sqrt(var1 / var0); end
+    if var1 > 0 && mobility > 0, complexity = sqrt(var2 / var1) / mobility; end
+    
+    [counts, ~] = histcounts(segment, 50);
+    prob = counts / sum(counts);
+    prob(prob == 0) = [];
+    shannon = -sum(prob .* log2(prob));
+    
+    nperseg = min(256, length(segment));
+    [Pxx, f] = pwelch(segment, nperseg, [], nperseg, fs);
+    
+    Pxx_norm = Pxx / (sum(Pxx) + 1e-10);
+    Pxx_norm(Pxx_norm == 0) = [];
+    spec_entropy = -sum(Pxx_norm .* log2(Pxx_norm));
+    
+    apen = 0; sampen = 0; permen = 0;
+    
+    bandNames = fieldnames(bands);
+    band_powers = zeros(1, length(bandNames));
+    for b = 1:length(bandNames)
+        band = bands.(bandNames{b});
+        idx = (f >= band(1)) & (f <= band(2));
+        if any(idx), band_powers(b) = trapz(f(idx), Pxx(idx));
+        else, band_powers(b) = 0; end
+    end
+    
+    features = [mean_val, std_val, median_val, skew_val, kurt_val, rms_val, zcr_val, ...
+                activity, mobility, complexity, shannon, spec_entropy, ...
+                apen, sampen, permen, band_powers];
+end
