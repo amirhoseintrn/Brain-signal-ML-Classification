@@ -36,7 +36,7 @@ This MATLAB project implements a complete pipeline to classify brain signals (EE
 1. Update `dataPath` in **Cell 1** to point to your folder of `.edf` files.
 2. Run **Cell 1** → extracts features and saves `eeg_features_final.mat`.
 3. Run **Cell 2** → normalisation, statistical tests, boxplots of top features.
-4. Run **Cells 10–13** → feature selection, dimensionality reduction, and final classification with 10‑fold CV.
+4. Run **Cells  after that** → feature selection, dimensionality reduction, and final classification with 10‑fold CV.
 
 ## 📊 Output
 
@@ -57,8 +57,6 @@ This MATLAB project implements a complete pipeline to classify brain signals (EE
 
 ## 👤 Author
 
-[Your Name] – Final Year Project / EEG Classification Study
+[Amirhosein toorani] – practicing proj / EEG Classification Study
 
-## 📄 License
 
-MIT
